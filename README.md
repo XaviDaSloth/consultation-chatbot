@@ -183,32 +183,20 @@ The app will be available at `http://localhost:3000`.
 
 ### Supabase Setup
 
-1. Create the tables above in your Supabase SQL editor
-2. Create a storage bucket called `research_pdf_files`
-3. Set the bucket to **private**
-4. Enable the `pgvector` extension in Supabase
-5. Create the `hybrid_search` RPC function (vector + full-text search):
+### Running Migrations
 
-```sql
-CREATE OR REPLACE FUNCTION hybrid_search(
-  document_ids uuid[],
-  query_text text,
-  query_embedding vector(1536),
-  match_count int
-)
-RETURNS TABLE (
-  id uuid,
-  chunk_content text,
-  page_no int
-)
-LANGUAGE sql
-AS $$
-  SELECT id, chunk_content, page_no
-  FROM chunks_and_embeddings
-  WHERE document_id = ANY(document_ids)
-  ORDER BY embedding <=> query_embedding
-  LIMIT match_count;
-$$;
+All migrations are in the `supabase/migrations/` folder. Run them **in order** in your Supabase SQL editor:
+
+1. Go to your Supabase project → **SQL Editor**
+2. Open and run `001_initial_schema.sql`
+3. Run any subsequent numbered files in order
+
+Or run them all at once if you have the Supabase CLI:
+
+```bash
+supabase db push
+```
+
 ```
 
 ---
@@ -230,23 +218,25 @@ $$;
 ## 💬 How It Works
 
 ```
+
 1. User uploads a PDF
-       ↓
+   ↓
 2. File stored in Supabase Storage
-       ↓
+   ↓
 3. PDF parsed into pages → chunked (512 tokens) → embedded (OpenAI)
-       ↓
+   ↓
 4. Embeddings saved to Supabase with page metadata
-       ↓
+   ↓
 5. User asks a question
-       ↓
+   ↓
 6. Query embedded → hybrid search finds relevant chunks
-       ↓
+   ↓
 7. Chunks + query sent to GPT-4o Mini
-       ↓
+   ↓
 8. Response streams token by token to the frontend
-       ↓
+   ↓
 9. Structured citations extracted and displayed with page numbers
+
 ```
 
 ---
@@ -299,3 +289,4 @@ $$;
 ## 📄 License
 
 MIT
+```
