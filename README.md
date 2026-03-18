@@ -2,6 +2,8 @@
 
 A full-stack AI-powered chatbot that lets you upload PDF documents and have intelligent conversations about their content. Built with **Next.js**, **FastAPI**, **Supabase**, and **OpenAI**.
 
+<img width="1910" height="953" alt="image" src="https://github.com/user-attachments/assets/fbe8fb3f-de07-4bf9-9892-d8fdbdcaf1cd" />
+
 ---
 
 ## ✨ Features
