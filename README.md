@@ -65,7 +65,8 @@ consultation-chatbot/
 -- Stores chat sessions
 session (
   id uuid PRIMARY KEY,
-  created_at timestamptz
+  created_at timestamptz,
+  context_summary text
 )
 
 -- Groups documents per session
