@@ -2,7 +2,7 @@ export interface CitationEvidence {
   extracted_specific_citation: string;
   chunk_id: string;
   page_no: number;
-  doc_name?: string; // 👈 add this
+  doc_name?: string; 
 }
 export interface AIResponse {
   direct_answer: string;

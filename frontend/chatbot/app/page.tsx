@@ -40,13 +40,11 @@ export default function Home() {
     // Fetch messages and files in parallel
     const [messagesRes, filesRes] = await Promise.all([
       fetch(`${process.env.NEXT_PUBLIC_API_URL}/sessions/${id}/messages`),
-      fetch(`${process.env.NEXT_PUBLIC_API_URL}/sessions/${id}/files`), // 👈 add this
+      fetch(`${process.env.NEXT_PUBLIC_API_URL}/sessions/${id}/files`),
     ]);
 
     const messagesData = await messagesRes.json();
     const filesData = await filesRes.json();
-
-    console.log("files for session:", filesData); // temporary — check what comes back
 
     // Populate sessionFileIds for sending with chat messages
     setSessionFiles(filesData);
@@ -212,7 +210,7 @@ export default function Home() {
           <FileUploader
             onFileReady={handleFileReady}
             sessionId={sessionId}
-            onBeforeUpload={ensureSession} // 👈 this was missing
+            onBeforeUpload={ensureSession}
           />
           {uploadedFiles.length > 0 && (
             <div className="space-y-1">

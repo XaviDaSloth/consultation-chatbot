@@ -5,7 +5,7 @@ import { UploadedFile } from "@/types";
 interface Props {
   onFileReady: (file: UploadedFile) => void;
   sessionId: string | null;
-  onBeforeUpload: () => Promise<string>; // 👈 added
+  onBeforeUpload: () => Promise<string>;
 }
 
 export default function FileUploader({
@@ -23,14 +23,12 @@ export default function FileUploader({
     if (!file || file.type !== "application/pdf") return;
     setStatus("uploading");
 
-    // 👇 call ensureSession FIRST, get the guaranteed session ID back
     const currentSessionId = await onBeforeUpload();
     console.log("Uploading file with session_id:", currentSessionId);
 
     const formData = new FormData();
     formData.append("file", file);
 
-    // 👇 use currentSessionId, NOT the sessionId prop (which may still be null)
     const uploadUrl = `${process.env.NEXT_PUBLIC_API_URL}/uploadfile?session_id=${currentSessionId}`;
 
     const uploadRes = await fetch(uploadUrl, {
