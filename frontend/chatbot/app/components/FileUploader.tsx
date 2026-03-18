@@ -4,10 +4,15 @@ import { UploadedFile } from "@/types";
 
 interface Props {
   onFileReady: (file: UploadedFile) => void;
-  sessionId: string | null; // 👈 add this
+  sessionId: string | null;
+  onBeforeUpload: () => Promise<string>; // 👈 added
 }
 
-export default function FileUploader({ onFileReady, sessionId }: Props) {
+export default function FileUploader({
+  onFileReady,
+  sessionId,
+  onBeforeUpload,
+}: Props) {
   const [status, setStatus] = useState<"idle" | "uploading" | "processing">(
     "idle",
   );
@@ -18,13 +23,15 @@ export default function FileUploader({ onFileReady, sessionId }: Props) {
     if (!file || file.type !== "application/pdf") return;
     setStatus("uploading");
 
+    // 👇 call ensureSession FIRST, get the guaranteed session ID back
+    const currentSessionId = await onBeforeUpload();
+    console.log("Uploading file with session_id:", currentSessionId);
+
     const formData = new FormData();
     formData.append("file", file);
 
-    // sessionId is now guaranteed to exist before upload
-    const uploadUrl = sessionId
-      ? `${process.env.NEXT_PUBLIC_API_URL}/uploadfile?session_id=${sessionId}`
-      : `${process.env.NEXT_PUBLIC_API_URL}/uploadfile`;
+    // 👇 use currentSessionId, NOT the sessionId prop (which may still be null)
+    const uploadUrl = `${process.env.NEXT_PUBLIC_API_URL}/uploadfile?session_id=${currentSessionId}`;
 
     const uploadRes = await fetch(uploadUrl, {
       method: "POST",
@@ -35,9 +42,7 @@ export default function FileUploader({ onFileReady, sessionId }: Props) {
     setStatus("processing");
     await fetch(
       `${process.env.NEXT_PUBLIC_API_URL}/process_file?file_id=${file_id}`,
-      {
-        method: "POST",
-      },
+      { method: "POST" },
     );
 
     setStatus("idle");

@@ -47,10 +47,12 @@ function AIMessage({ message }: { message: any }) {
   }
 
   // Case 3 — structured object (saved by old /conversation endpoint)
-  if (typeof content === "object" && content.direct_answer) {
+  if (typeof content === "object" && content !== null) {
+    // Handles both { direct_answer } and any other object shape
+    const answer = content.direct_answer || JSON.stringify(content);
     return (
       <>
-        <p>{content.direct_answer}</p>
+        <p>{answer}</p>
         {content.supporting_and_evidence?.length > 0 && (
           <CitationCard evidence={content.supporting_and_evidence} />
         )}

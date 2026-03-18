@@ -12,19 +12,19 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
 import pydantic
-import funkybob
 import json
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import asyncio
 import uuid
+import tiktoken
 
 load_dotenv()
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # your Next.js URL
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,6 +42,17 @@ if url:
 supabase: Client = create_client(url, key)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Tokenizer for context window management
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
+TOKEN_LIMIT = 2000
+TOKEN_SUMMARIZE_THRESHOLD = 1950
+
+
+# ─────────────────────────────────────────────
+# Pydantic models
+# ─────────────────────────────────────────────
+
 
 class GetFile(BaseModel):
     file: UploadFile = (File(...),)
@@ -58,11 +69,83 @@ class CitationEvidence(BaseModel):
     extracted_specific_citation: str
     chunk_id: str
     page_no: int
+    doc_name: Optional[str] = None
 
 
 class AIResponse(BaseModel):
     direct_answer: str
     supporting_and_evidence: List[CitationEvidence]
+
+
+# ─────────────────────────────────────────────
+# Token helpers
+# ─────────────────────────────────────────────
+
+
+def count_tokens(text: str) -> int:
+    return len(tokenizer.encode(text))
+
+
+def messages_to_text(messages: list[dict]) -> str:
+    """Flatten message list to a single string for token counting."""
+    parts = []
+    for m in messages:
+        role = m.get("message_source", "unknown")
+        content = m.get("content", "")
+        parts.append(f"{role}: {content}")
+    return "\n".join(parts)
+
+
+def trim_messages_to_token_limit(messages: list[dict], limit: int) -> list[dict]:
+    """
+    Keep the most recent messages that fit within `limit` tokens.
+    Messages are assumed to be in descending order (newest first from Supabase).
+    We reverse, trim from the front, then return in chronological order.
+    """
+    chronological = list(reversed(messages))
+    while chronological:
+        text = messages_to_text(chronological)
+        if count_tokens(text) <= limit:
+            break
+        chronological.pop(0)  # drop oldest
+    return chronological
+
+
+def summarize_history(messages: list[dict], session_id: str) -> str:
+    """
+    Ask the AI to summarize the conversation history and persist it to the session.
+    Returns the generated summary string.
+    """
+    history_text = messages_to_text(messages)
+    summary_response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise summarizer. "
+                    "Summarize the following conversation history into a compact paragraph "
+                    "that captures the key topics discussed, questions asked, and answers given. "
+                    "Be specific, not generic."
+                ),
+            },
+            {"role": "user", "content": history_text},
+        ],
+        max_tokens=400,
+    )
+    summary = summary_response.choices[0].message.content.strip()
+
+    # Persist summary to session table
+    supabase.table("session").update({"context_summary": summary}).eq(
+        "id", session_id
+    ).execute()
+
+    return summary
+
+
+# ─────────────────────────────────────────────
+# Chunking & embedding helpers (unchanged)
+# ─────────────────────────────────────────────
 
 
 def chunking(pages: List[dict]):
@@ -91,14 +174,12 @@ async def store_embeddings(all_chunks, document_id):
 
     for chunk in all_chunks:
         try:
-            # Create embedding
             embed_chunk = client.embeddings.create(
                 model="text-embedding-3-small",
-                input=chunk["content"],  # use attribute, not ["page_content"]
+                input=chunk["content"],
             )
             vector = embed_chunk.data[0].embedding
 
-            # Prepare data to store in Supabase
             data = {
                 "document_id": document_id,
                 "chunk_content": chunk["content"],
@@ -106,16 +187,14 @@ async def store_embeddings(all_chunks, document_id):
                 "embedding": vector,
             }
 
-            # Insert into Supabase
             supabase.table("chunks_and_embeddings").insert(data).execute()
             results["success"] += 1
 
         except Exception as error:
             results["failed"] += 1
             results["errors"].append({"page_no": chunk["page_no"], "error": str(error)})
-            print(f"Error storing chunk for page {chunk["page_no"]}: {error}")
+            print(f"Error storing chunk for page {chunk['page_no']}: {error}")
 
-    # Return a summary
     if results["failed"] == 0:
         results["message"] = "All chunks stored successfully"
     else:
@@ -134,7 +213,7 @@ def store_to_bucket(path, file, content_type):
         return store_response
     except Exception as error:
         print(f"Storage upload error: {error}")
-        raise  # 👈 re-raise so the endpoint knows something went wrong
+        raise
 
 
 def store_file(filename, filepath, folder_id, mime_type):
@@ -159,6 +238,21 @@ def store_file(filename, filepath, folder_id, mime_type):
 
 def create_folder(name: str = None, session_id: str = None):
     print("create_folder called with session_id:", session_id)
+
+    # If session already has a folder, reuse it
+    if session_id:
+        existing = (
+            supabase.table("folder")
+            .select("id")
+            .eq("session_id", session_id)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            print("Reusing existing folder:", existing.data[0]["id"])
+            return existing.data[0]["id"]
+
+    # Otherwise create a new one
     store_response = (
         supabase.table("folder")
         .insert(
@@ -177,20 +271,16 @@ def create_folder(name: str = None, session_id: str = None):
 
 
 def fetch_from_private_bucket(path):
-    # returns bytes, must be converted into ByteIO if it were to be passed into pydf
     fetch_response = supabase.storage.from_("research_pdf_files").download(path)
-
     return fetch_response
 
 
 def fetch_from_public_bucket(path):
     fetch_response = supabase.storage.from_("research_pdf_files").get_public_url(path)
-
     return fetch_response
 
 
 def read_pdf(contents):
-    # converts bytes into pypdf readable format
     pdf_file = BytesIO(contents)
     reader = PdfReader(pdf_file)
     all_chunks = []
@@ -201,24 +291,16 @@ def read_pdf(contents):
     return all_chunks
 
 
-def read_text(file):
-    with open(file) as f:
-        open_file = f.read()
-
-
 def get_embeddings(query: str, document_ids: List[str], match_count: int = 5):
-
+    print("=== GET EMBEDDINGS ===")
+    print("document_ids:", document_ids)
+    print("query:", query)
     embed_query = client.embeddings.create(
         model="text-embedding-3-small",
-        input=query,  # use attribute, not ["page_content"]
+        input=query,
     )
     print("Document IDs received:", document_ids)
-    print("Document IDs types:", [type(id) for id in document_ids])
 
-    # Check what's actually in the DB
-    check = supabase.table("documents").select("id").in_("id", document_ids).execute()
-    print("Matching DB records:", check.data)
-    output = []
     embed_response = supabase.rpc(
         "hybrid_search",
         {
@@ -228,83 +310,291 @@ def get_embeddings(query: str, document_ids: List[str], match_count: int = 5):
             "match_count": match_count,
         },
     ).execute()
-    # print("EMBEDDING RESPONSE: ", embed_response)
+
+    # Build a doc_id → doc_name lookup so citations can show the filename
+    unique_doc_ids = list(
+        {row["document_id"] for row in embed_response.data if "document_id" in row}
+    )
+    doc_name_map: dict[str, str] = {}
+    if unique_doc_ids:
+        docs = (
+            supabase.table("documents")
+            .select("id, doc_name")
+            .in_("id", unique_doc_ids)
+            .execute()
+        )
+        doc_name_map = {d["id"]: d["doc_name"] for d in docs.data}
+
+    output = []
     for row in embed_response.data:
+        doc_id = row.get("document_id")
         output.append(
             {
                 "id": row["id"],
                 "chunk_content": row["chunk_content"],
                 "page_no": row["page_no"],
+                "document_id": doc_id,
+                "doc_name": doc_name_map.get(doc_id, "Unknown file"),
             }
         )
 
     return output
 
 
-def ask_ai(user_query: str, chunks: List[dict]) -> AIResponse:
-    # Format chunks for the prompt
+# ─────────────────────────────────────────────
+# Agent-based ask_ai (replaces old ask_ai)
+# ─────────────────────────────────────────────
 
-    formatted_chunks = "\n\n".join(
-        [
-            f"[Chunk ID: {c['id']} | Page: {c['page_no']}]\n{c['chunk_content']}"
-            for c in chunks
-        ]
-    )
+# Tool definition for the OpenAI tool-calling API
+SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_documents",
+        "description": (
+            "Search the user's uploaded research documents using a semantic + keyword hybrid search. "
+            "Use this when the question is answerable from document content. "
+            "Returns relevant text chunks with their chunk IDs and page numbers."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "search_query": {
+                    "type": "string",
+                    "description": (
+                        "A focused search query optimised for retrieval. "
+                        "Should target the specific fact or concept needed."
+                    ),
+                }
+            },
+            "required": ["search_query"],
+        },
+    },
+}
 
-    system_prompt = """You are a precise research assistant analyzing document chunks.
 
-Rules:
-1. Read all provided chunks carefully before answering.
-2. Answer the user's question directly and specifically using the chunk content.
-3. Quote or reference specific details, names, dates, and facts from the chunks.
-4. If the chunks genuinely do not contain relevant information, say exactly what topic the chunks DO cover instead of giving a vague non-answer.
-5. Never give generic or vague answers like "the document describes the topic" — always be specific.
-6. Do not use outside knowledge, but do use your reasoning to connect information within the chunks."""
+def ask_ai(
+    user_query: str,
+    document_ids: List[str],
+    conversation_history: list[dict],
+    context_summary: Optional[str],
+) -> AIResponse:
+    """
+    Agent loop:
+      1. Evaluate the query (relevant / irrelevant / needs clarification).
+      2. If relevant, call search_documents (up to MAX_TOOL_CALLS times).
+      3. Synthesise a structured AIResponse.
+    """
+    MAX_TOOL_CALLS = 2
 
-    user_prompt = f"""User Query: {user_query}
+    # ── Build conversation history block ──────────────────────────────────
+    history_block = ""
+    if context_summary:
+        history_block += f"[Conversation summary so far]\n{context_summary}\n\n"
+    if conversation_history:
+        history_block += "[Recent conversation]\n"
+        for m in conversation_history:
+            role = "User" if m["message_source"] == "user" else "Assistant"
+            # AI messages are stored as JSON; surface only direct_answer for readability
+            content = m["content"]
+            try:
+                parsed = json.loads(content)
+                content = parsed.get("direct_answer", content)
+            except Exception:
+                pass
+            history_block += f"{role}: {content}\n"
+        history_block += "\n"
 
-Retrieved Chunks:
-{formatted_chunks}
+    system_prompt = f"""You are a precise research assistant with access to a document search tool.
 
-Respond with a JSON object matching this structure:
-{{
-  "direct_answer": "<your answer strictly based on chunks, or a message that no relevant info was found>",
-  "supporting_and_evidence": [
+    {history_block}## Your workflow
+
+    ### Step 1 — Query analysis
+    Before doing anything else, decide:
+    - RELEVANT: The question can plausibly be answered from research documents.
+    → This includes general questions like "what is this about?", "summarize this", 
+        "what is this letter for?", "who wrote this?" — always attempt a search first.
+    → When in doubt, ALWAYS default to RELEVANT and search.
+    - IRRELEVANT: The question is clearly unrelated to documents (e.g. "What's the weather?", 
+    "Tell me a joke", "What's 1+1"). Only use this for obviously off-topic questions.
+    → Return immediately with a polite message explaining this.
+    - NEEDS_CLARIFICATION: Only use this if there are multiple loaded documents and the question 
+    is truly ambiguous about which one (e.g. "what is page 5?"). 
+    → Never use this for general questions about document content.
+
+    ### Step 2 — Search (max {MAX_TOOL_CALLS} calls)
+    Call `search_documents` with a focused query. For general questions like "what is this about"
+    or "what is this letter for", search using keywords from the document type or topic.
+    You may refine and call again once if the first results are insufficient.
+
+    ### Step 3 — Answer
+    Using only the retrieved chunks, give a direct, specific answer with citations.
+    Never fabricate information not present in the chunks.
+    Never give generic answers like "the document discusses this topic."
+    Always be specific — quote names, dates, amounts, and key facts from the chunks.
+
+    ## Output format
+    Always respond with a JSON object:
     {{
-      "extracted_specific_citation": "<exact sentence or phrase from the chunk>",
-      "chunk_id": "<the chunk_id it came from>"
-      "page_no": <the page number from the chunk metadata>
+    "direct_answer": "<specific answer based on chunks>",
+    "supporting_and_evidence": [
+        {{
+        "extracted_specific_citation": "<exact phrase from chunk>",
+        "chunk_id": "<chunk id>",
+        "page_no": <page number>,
+        "doc_name": "<file name from chunk metadata>"
+        }}
+    ]
     }}
-  ]
-}}"""
+    If truly irrelevant or needs clarification, supporting_and_evidence should be an empty list.
+    """
 
-    response = client.beta.chat.completions.parse(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format=AIResponse,
-    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_query},
+    ]
 
-    return response.choices[0].message.parsed
+    tool_calls_made = 0
+    accumulated_chunks: List[dict] = []
+
+    # ── Agent loop ────────────────────────────────────────────────────────
+    while True:
+        for i, msg in enumerate(messages):
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                # Check if all tool_call_ids have a corresponding tool response
+                tool_ids = {tc.id for tc in msg.tool_calls}
+                responded_ids = {
+                    m.get("tool_call_id")
+                    for m in messages[i + 1 :]
+                    if isinstance(m, dict) and m.get("role") == "tool"
+                }
+                missing = tool_ids - responded_ids
+                if missing:
+                    print(
+                        f"[Agent] Found orphaned tool calls: {missing}, injecting empty responses"
+                    )
+                    for missing_id in missing:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": missing_id,
+                                "content": "No result available.",
+                            }
+                        )
+
+        under_cap = tool_calls_made < MAX_TOOL_CALLS
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            tools=[SEARCH_TOOL] if under_cap else None,
+            tool_choice="auto" if under_cap else None,
+        )
+
+        choice = response.choices[0]
+
+        # ── Tool call branch ──────────────────────────────────────────────
+        if choice.finish_reason == "tool_calls":
+            tool_call = choice.message.tool_calls[0]
+            args = json.loads(tool_call.function.arguments)
+            search_query = args.get("search_query", user_query)
+
+            print(
+                f"[Agent] Tool call #{tool_calls_made + 1}: search_documents('{search_query}')"
+            )
+
+            # Append the assistant message FIRST — before any work that could
+            # throw. This guarantees tool_call_id always has a paired response.
+            messages.append(choice.message)
+
+            try:
+                chunks = get_embeddings(search_query, document_ids)
+                accumulated_chunks.extend(chunks)
+                tool_result = (
+                    "\n\n".join(
+                        [
+                            f"[Chunk ID: {c['id']} | Page: {c['page_no']} | File: {c.get('doc_name', 'Unknown')}]\n{c['chunk_content']}"
+                            for c in chunks
+                        ]
+                    )
+                    or "No relevant chunks found."
+                )
+            except Exception as e:
+                print(f"[Agent] search failed: {e}")
+                tool_result = "Search failed. No chunks retrieved."
+                chunks = []
+
+            tool_calls_made += 1
+
+            # Always append the tool result — even on error — so the
+            # message history stays valid and OpenAI never sees an
+            # orphaned tool_call_id.
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result,
+                }
+            )
+
+            # Once the cap is hit, tell the model to wrap up.
+            if tool_calls_made >= MAX_TOOL_CALLS:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You have used all available search calls. "
+                            "Using only the chunks retrieved so far, provide your final answer "
+                            "in the required JSON format."
+                        ),
+                    }
+                )
+
+            continue
+
+        # ── Final answer branch ───────────────────────────────────────────
+        raw_text = choice.message.content or ""
+
+        # Strip markdown fences if present
+        clean = raw_text.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"^```[a-z]*\n?", "", clean)
+            clean = re.sub(r"\n?```$", "", clean)
+            clean = clean.strip()
+
+        try:
+            parsed = json.loads(clean)
+            return AIResponse(**parsed)
+        except Exception as e:
+            print(
+                f"[Agent] Failed to parse final response as AIResponse: {e}\nRaw: {raw_text}"
+            )
+            # Graceful fallback
+            return AIResponse(
+                direct_answer=raw_text,
+                supporting_and_evidence=[],
+            )
+
+
+# ─────────────────────────────────────────────
+# Session helpers
+# ─────────────────────────────────────────────
 
 
 def check_create_session(session_id):
     if session_id is None:
-        # Create a new session
         new_session = supabase.table("session").insert({}).execute()
-        return {"session": new_session.data[0], "messages": []}
+        return {"session": new_session.data[0], "messages": [], "context_summary": None}
 
-    # Check if session exists
     check_session = supabase.table("session").select("*").eq("id", session_id).execute()
 
     if not check_session.data:
-        # Session not found, create a new one
         new_session = supabase.table("session").insert({}).execute()
-        return {"session": new_session.data[0], "messages": []}
+        return {"session": new_session.data[0], "messages": [], "context_summary": None}
 
-    # Session exists, fetch messages in descending order
+    session_row = check_session.data[0]
+    context_summary = session_row.get("context_summary")
+
+    # Fetch messages descending (newest first)
     messages = (
         supabase.table("messages")
         .select("*")
@@ -313,7 +603,47 @@ def check_create_session(session_id):
         .execute()
     )
 
-    return {"session": check_session.data[0], "messages": messages.data}
+    return {
+        "session": session_row,
+        "messages": messages.data,
+        "context_summary": context_summary,
+    }
+
+
+def prepare_history_and_maybe_summarize(
+    messages_desc: list[dict],
+    session_id: str,
+    context_summary: Optional[str],
+) -> tuple[list[dict], Optional[str]]:
+    """
+    1. Reverse to chronological order.
+    2. Count tokens of the full history (+ existing summary).
+    3. If over threshold: summarise + update DB, clear raw history for prompt.
+    4. Otherwise: trim to TOKEN_LIMIT.
+    Returns (trimmed_chronological_messages, effective_summary).
+    """
+    chronological = list(reversed(messages_desc))
+
+    # Build full text for token counting
+    full_text = (context_summary or "") + "\n" + messages_to_text(chronological)
+    total_tokens = count_tokens(full_text)
+
+    print(f"[Context] Total history tokens: {total_tokens}")
+
+    if total_tokens >= TOKEN_SUMMARIZE_THRESHOLD:
+        print("[Context] Threshold reached — summarising history...")
+        new_summary = summarize_history(chronological, session_id)
+        # After summarising, we pass an empty recent history and the new summary
+        return [], new_summary
+
+    # Otherwise trim to TOKEN_LIMIT from the oldest end
+    trimmed = trim_messages_to_token_limit(chronological, TOKEN_LIMIT)
+    return trimmed, context_summary
+
+
+# ─────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────
 
 
 @app.get("/")
@@ -335,18 +665,16 @@ async def analyze_file(file: UploadFile = File(...)):
 @app.get("/getFile")
 async def get_file(file_path: str):
     response = fetch_from_private_bucket(file_path)
-
     return {"file_download_info": response}
 
 
 @app.post("/uploadfile")
 async def read_file(file: UploadFile = File(...), session_id: Optional[str] = None):
     print("=== UPLOAD CALLED ===")
-    print("session_id received:", session_id)  # 👈 is it arriving?
+    print("session_id received:", session_id)
     print("file:", file.filename)
     contents = await file.read()
 
-    # Pass session_id to folder creation
     folder_id = create_folder(session_id=session_id)
 
     unique_path = f"{uuid.uuid4()}_{file.filename}"
@@ -367,12 +695,8 @@ async def process_file(file_id: str):
         return {"message": "File does not exist"}
 
     file = fetch_from_private_bucket(file_info.data[0]["file_path"])
-
-    # read file and add metadata(pages)
     organize_file = read_pdf(file)
-
     chunk_file = chunking(organize_file)
-
     embed_and_store = await store_embeddings(chunk_file, file_id)
     return {"message": embed_and_store}
 
@@ -399,12 +723,25 @@ async def get_session_messages(session_id: str):
 
 @app.post("/conversation")
 async def conversation(request: UserQuery):
+    # ── Session & history ──────────────────────────────────────────────────
     get_session = check_create_session(request.session_id)
     session_id = get_session["session"]["id"]
+    raw_messages = get_session["messages"]  # newest-first from DB
+    context_summary = get_session["context_summary"]
 
-    chunks = get_embeddings(request.user_query, request.file_ids)
-    ai_response = ask_ai(request.user_query, chunks)
+    trimmed_history, effective_summary = prepare_history_and_maybe_summarize(
+        raw_messages, session_id, context_summary
+    )
 
+    # ── Agent call ─────────────────────────────────────────────────────────
+    ai_response = ask_ai(
+        user_query=request.user_query,
+        document_ids=request.file_ids,
+        conversation_history=trimmed_history,
+        context_summary=effective_summary,
+    )
+
+    # ── Persist messages ───────────────────────────────────────────────────
     supabase.table("messages").insert(
         {
             "session_id": session_id,
@@ -421,29 +758,43 @@ async def conversation(request: UserQuery):
         }
     ).execute()
 
-    # 👇 add session_id to the response
     return {**ai_response.model_dump(), "session_id": session_id}
 
 
 @app.post("/conversation/stream")
 async def conversation_stream(request: UserQuery):
+    print("=== STREAM REQUEST ===")
+    print("file_ids received:", request.file_ids)
+    print("session_id received:", request.session_id)
+    print("user_query:", request.user_query)
+    # ── Session & history ──────────────────────────────────────────────────
     get_session = check_create_session(request.session_id)
     session_id = get_session["session"]["id"]
+    raw_messages = get_session["messages"]
+    context_summary = get_session["context_summary"]
 
-    chunks = get_embeddings(request.user_query, request.file_ids)
-
-    # Format chunks for the prompt (same as ask_ai)
-    formatted_chunks = "\n\n".join(
-        [f"[Chunk ID: {c['id']}]\n{c['chunk_content']}" for c in chunks]
+    trimmed_history, effective_summary = prepare_history_and_maybe_summarize(
+        raw_messages, session_id, context_summary
     )
 
-    system_prompt = """You are a precise research assistant. Answer strictly based on the chunks provided.
-For your response, first give a direct answer, then list your citations.
-Format your response as:
-ANSWER: <your answer here>
-CITATIONS: <cite the exact phrases that support your answer, one per line>"""
+    # Build history block (same logic as ask_ai, but reused here for streaming prompt)
+    history_block = ""
+    if effective_summary:
+        history_block += f"[Conversation summary so far]\n{effective_summary}\n\n"
+    if trimmed_history:
+        history_block += "[Recent conversation]\n"
+        for m in trimmed_history:
+            role = "User" if m["message_source"] == "user" else "Assistant"
+            content = m["content"]
+            try:
+                parsed = json.loads(content)
+                content = parsed.get("direct_answer", content)
+            except Exception:
+                pass
+            history_block += f"{role}: {content}\n"
+        history_block += "\n"
 
-    # Store user message first
+    # ── Store user message ─────────────────────────────────────────────────
     supabase.table("messages").insert(
         {
             "session_id": session_id,
@@ -453,65 +804,39 @@ CITATIONS: <cite the exact phrases that support your answer, one per line>"""
     ).execute()
 
     async def generate():
-        full_response = ""
-
         yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
 
         loop = asyncio.get_event_loop()
-        stream = await loop.run_in_executor(
+
+        # Run agent (sync) in executor to avoid blocking
+        ai_response: AIResponse = await loop.run_in_executor(
             None,
-            lambda: client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": f"Query: {request.user_query}\n\nChunks:\n{formatted_chunks}",
-                    },
-                ],
-                stream=True,
+            lambda: ask_ai(
+                user_query=request.user_query,
+                document_ids=request.file_ids,
+                conversation_history=trimmed_history,
+                context_summary=effective_summary,
             ),
         )
 
-        for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                full_response += delta
-                yield f"data: {json.dumps({'type': 'token', 'value': delta})}\n\n"
-                await asyncio.sleep(0)
+        # Stream the direct_answer token by token (character level for simplicity)
+        answer = ai_response.direct_answer
+        chunk_size = 4  # stream in small bursts
+        for i in range(0, len(answer), chunk_size):
+            token = answer[i : i + chunk_size]
+            yield f"data: {json.dumps({'type': 'token', 'value': token})}\n\n"
+            await asyncio.sleep(0.03)
 
-        # After streaming is done, parse into structured format
-        structured = await loop.run_in_executor(
-            None,
-            lambda: client.beta.chat.completions.parse(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"""Extract the answer and citations from this response.
-                            Original query: {request.user_query}
-                            Response: {full_response}
-                            Chunks used: {formatted_chunks}
-
-                            Map each supporting point back to the exact chunk it came from.""",
-                    }
-                ],
-                response_format=AIResponse,  # your existing Pydantic model
-            ),
-        )
-
-        structured_data = structured.choices[0].message.parsed
-
-        # Send structured data to frontend so it can show citations
-        yield f"data: {json.dumps({'type': 'structured', 'data': structured_data.model_dump()})}\n\n"
+        # Send structured data
+        yield f"data: {json.dumps({'type': 'structured', 'data': ai_response.model_dump()})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
-        # Save structured format to DB — same as old endpoint
+        # Persist AI message
         supabase.table("messages").insert(
             {
                 "session_id": session_id,
                 "message_source": "ai",
-                "content": json.dumps(structured_data.model_dump()),
+                "content": json.dumps(ai_response.model_dump()),
             }
         ).execute()
 
@@ -520,14 +845,13 @@ CITATIONS: <cite the exact phrases that support your answer, one per line>"""
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # 👈 prevents proxy buffering
+            "X-Accel-Buffering": "no",
         },
     )
 
 
 @app.get("/sessions/{session_id}/files")
 async def get_session_files(session_id: str):
-    # Get folder for this session
     folder = (
         supabase.table("folder").select("id").eq("session_id", session_id).execute()
     )
@@ -537,7 +861,6 @@ async def get_session_files(session_id: str):
 
     folder_ids = [f["id"] for f in folder.data]
 
-    # Get all documents in those folders
     docs = (
         supabase.table("documents")
         .select("id, doc_name")

@@ -27,6 +27,8 @@ export default function Home() {
     setSessionId(null);
     setMessages([]);
     setUploadedFiles([]);
+    setSessionFiles([]);
+    setSessionFileIds([]);
     setInput("");
   }
 
@@ -79,19 +81,26 @@ export default function Home() {
   }
 
   async function handleFileReady(file: UploadedFile) {
-    let currentSessionId = sessionId;
-
-    if (!currentSessionId) {
-      currentSessionId = await createSession();
-      setSessionId(currentSessionId);
-    }
-
     setUploadedFiles((prev) => [...prev, file]);
-    setSessionFileIds((prev) => [...prev, file.file_id]); // 👈 keep in sync
+    setSessionFileIds((prev) => [...prev, file.file_id]);
   }
 
   function handleRemoveFile(fileId: string) {
     setUploadedFiles((prev) => prev.filter((f) => f.file_id !== fileId));
+  }
+
+  async function ensureSession(): Promise<string> {
+    if (sessionId) {
+      console.log("Session already exists:", sessionId);
+      return sessionId;
+    }
+    console.log("No session yet, creating one...");
+    const newId = await createSession();
+    console.log("New session created:", newId);
+    setSessionId(newId);
+    setSessionFiles([]);
+    setSessionFileIds([]);
+    return newId;
   }
 
   async function sendMessage() {
@@ -163,6 +172,7 @@ export default function Home() {
 
         if (json.type === "structured") {
           // Replace the streamed plain text with the full structured response
+          console.log("structured data received:", json.data);
           setMessages((prev) => {
             const updated = [...prev];
             const last = updated[updated.length - 1];
@@ -199,7 +209,11 @@ export default function Home() {
       <main className="flex flex-col flex-1 overflow-hidden">
         {/* File area */}
         <div className="p-4 border-b border-gray-800 space-y-3">
-          <FileUploader onFileReady={handleFileReady} sessionId={sessionId} />
+          <FileUploader
+            onFileReady={handleFileReady}
+            sessionId={sessionId}
+            onBeforeUpload={ensureSession} // 👈 this was missing
+          />
           {uploadedFiles.length > 0 && (
             <div className="space-y-1">
               <p className="text-xs text-gray-500 uppercase tracking-wide">

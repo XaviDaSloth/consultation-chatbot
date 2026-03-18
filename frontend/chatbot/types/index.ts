@@ -1,9 +1,9 @@
 export interface CitationEvidence {
   extracted_specific_citation: string;
   chunk_id: string;
-  page_no: number; 
+  page_no: number;
+  doc_name?: string; // 👈 add this
 }
-
 export interface AIResponse {
   direct_answer: string;
   supporting_and_evidence: CitationEvidence[];
