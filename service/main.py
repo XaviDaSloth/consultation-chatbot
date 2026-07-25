@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from typing import Annotated, List, Optional
 from fastapi import FastAPI, File, UploadFile
 from io import BytesIO
@@ -24,7 +24,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://192.168.254.104:3000",
+    ],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+):3000$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -673,32 +678,55 @@ async def read_file(file: UploadFile = File(...), session_id: Optional[str] = No
     print("=== UPLOAD CALLED ===")
     print("session_id received:", session_id)
     print("file:", file.filename)
-    contents = await file.read()
+    try:
+        contents = await file.read()
 
-    folder_id = create_folder(session_id=session_id)
+        folder_id = create_folder(session_id=session_id)
+        if not folder_id or folder_id == "Error in storing folder":
+            raise RuntimeError("Could not create or reuse a folder for this session")
 
-    unique_path = f"{uuid.uuid4()}_{file.filename}"
+        unique_path = f"{uuid.uuid4()}_{file.filename}"
 
-    store_file_to_bucket = store_to_bucket(unique_path, contents, file.content_type)
-    store_file_to_table = store_file(
-        file.filename, store_file_to_bucket.path, folder_id, file.content_type
-    )
+        store_file_to_bucket = store_to_bucket(unique_path, contents, file.content_type)
+        store_file_to_table = store_file(
+            file.filename, store_file_to_bucket.path, folder_id, file.content_type
+        )
 
-    return {"file_id": store_file_to_table, "folder_id": folder_id}
+        if not store_file_to_table:
+            raise RuntimeError("Could not save file metadata")
+
+        return {"file_id": store_file_to_table, "folder_id": folder_id}
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Upload failed")
+        raise HTTPException(status_code=500, detail=str(error)) from error
 
 
 @app.post("/process_file")
 async def process_file(file_id: str):
-    file_info = supabase.table("documents").select("*").eq("id", file_id).execute()
+    try:
+        file_info = supabase.table("documents").select("*").eq("id", file_id).execute()
 
-    if not file_info.data:
-        return {"message": "File does not exist"}
+        if not file_info.data:
+            raise HTTPException(status_code=404, detail="File does not exist")
 
-    file = fetch_from_private_bucket(file_info.data[0]["file_path"])
-    organize_file = read_pdf(file)
-    chunk_file = chunking(organize_file)
-    embed_and_store = await store_embeddings(chunk_file, file_id)
-    return {"message": embed_and_store}
+        file = fetch_from_private_bucket(file_info.data[0]["file_path"])
+        organize_file = read_pdf(file)
+        if not organize_file:
+            raise HTTPException(
+                status_code=422,
+                detail="No extractable text was found in this PDF",
+            )
+
+        chunk_file = chunking(organize_file)
+        embed_and_store = await store_embeddings(chunk_file, file_id)
+        return {"message": embed_and_store}
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("File processing failed")
+        raise HTTPException(status_code=500, detail=str(error)) from error
 
 
 @app.get("/sessions")

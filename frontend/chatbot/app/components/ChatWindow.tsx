@@ -1,23 +1,23 @@
 import { Message } from "@/types";
 import CitationCard from "./CitationCard";
 
-export default function ChatWindow({ messages }: { messages: any[] }) {
+export default function ChatWindow({ messages }: { messages: Message[] }) {
   return (
-    <div className="flex flex-col gap-4 p-4 overflow-y-auto h-full">
+    <div className="flex h-full flex-col gap-5 overflow-y-auto px-6 py-5">
       {messages.map((msg, i) => (
         <div
           key={i}
           className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
         >
           <div
-            className={`max-w-[75%] rounded-xl p-4 ${
+            className={`max-w-[min(760px,82%)] rounded-lg px-4 py-3 text-sm leading-6 shadow-sm ${
               msg.role === "user"
-                ? "bg-blue-600 text-white"
-                : "bg-gray-800 text-gray-100"
+                ? "bg-teal-600 text-white"
+                : "border border-gray-800 bg-gray-900 text-gray-100"
             }`}
           >
             {msg.role === "user" ? (
-              <p>{msg.content}</p>
+              <p className="whitespace-pre-wrap">{msg.content as string}</p>
             ) : (
               <AIMessage message={msg} />
             )}
@@ -28,37 +28,31 @@ export default function ChatWindow({ messages }: { messages: any[] }) {
   );
 }
 
-function AIMessage({ message }: { message: any }) {
+function AIMessage({ message }: { message: Message }) {
   const content = message.content;
 
-  // Case 1 — currently streaming (plain string, cursor visible)
   if (message.isStreaming) {
     return (
-      <p>
-        {content}
-        <span className="inline-block w-2 h-4 bg-violet-400 ml-1 animate-pulse" />
+      <p className="whitespace-pre-wrap">
+        {content as string}
+        <span className="ml-1 inline-block h-4 w-1.5 translate-y-0.5 rounded-full bg-teal-300 animate-pulse" />
       </p>
     );
   }
 
-  // Case 2 — plain string (saved by streaming endpoint)
   if (typeof content === "string") {
-    return <p>{content}</p>;
+    return <p className="whitespace-pre-wrap">{content}</p>;
   }
 
-  // Case 3 — structured object (saved by old /conversation endpoint)
   if (typeof content === "object" && content !== null) {
     const answer = content.direct_answer || JSON.stringify(content);
     return (
-      <>
-        <p>{answer}</p>
-        {content.supporting_and_evidence?.length > 0 && (
-          <CitationCard evidence={content.supporting_and_evidence} />
-        )}
-      </>
+      <div className="space-y-3">
+        <p className="whitespace-pre-wrap">{answer}</p>
+        <CitationCard evidence={content.supporting_and_evidence ?? []} />
+      </div>
     );
   }
 
-  // Fallback
   return <p className="text-gray-500 italic">Unable to display message.</p>;
 }

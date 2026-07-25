@@ -1,23 +1,33 @@
 "use client";
-import { useState, useRef, useEffect } from "react";
-import Sidebar from "./components/Sidebar";
-import FileUploader from "./components/FileUploader";
-import FileChip from "./components/FileChip";
+
+import { useEffect, useRef, useState } from "react";
 import ChatWindow from "./components/ChatWindow";
+import FileChip from "./components/FileChip";
+import FileUploader from "./components/FileUploader";
+import Sidebar from "./components/Sidebar";
+import { getApiUrl } from "@/lib/api";
 import { Message, UploadedFile } from "@/types";
+
+type SessionFile = { id: string; doc_name: string };
+type SessionMessage = { message_source: "user" | "ai"; content: string };
+type StreamEvent =
+  | { type: "session"; session_id: string }
+  | { type: "token"; value: string }
+  | { type: "structured"; data: Message["content"] }
+  | { type: "done" };
 
 export default function Home() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [sessionFileIds, setSessionFileIds] = useState<string[]>([]);
-  const [sessionFiles, setSessionFiles] = useState<
-    { id: string; doc_name: string }[]
-  >([]);
+  const [sessionFiles, setSessionFiles] = useState<SessionFile[]>([]);
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
   const [sessionLoading, setSessionLoading] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  const canChat = uploadedFiles.length > 0 || sessionId !== null;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -37,45 +47,42 @@ export default function Home() {
     setUploadedFiles([]);
     setSessionLoading(true);
 
-    // Fetch messages and files in parallel
     const [messagesRes, filesRes] = await Promise.all([
-      fetch(`${process.env.NEXT_PUBLIC_API_URL}/sessions/${id}/messages`),
-      fetch(`${process.env.NEXT_PUBLIC_API_URL}/sessions/${id}/files`),
+      fetch(getApiUrl(`/sessions/${id}/messages`)),
+      fetch(getApiUrl(`/sessions/${id}/files`)),
     ]);
 
-    const messagesData = await messagesRes.json();
-    const filesData = await filesRes.json();
+    const messagesData = (await messagesRes.json()) as SessionMessage[];
+    const filesData = (await filesRes.json()) as SessionFile[];
 
-    // Populate sessionFileIds for sending with chat messages
     setSessionFiles(filesData);
-    setSessionFileIds(filesData.map((f: any) => f.id));
+    setSessionFileIds(filesData.map((f) => f.id));
 
-    const reversed = [...messagesData].reverse();
-    const formatted: Message[] = reversed.map((msg: any) => {
+    const formatted: Message[] = [...messagesData].reverse().map((msg) => {
       if (msg.message_source === "user") {
         return { role: "user", content: msg.content };
       }
-      let content;
+
+      let content: Message["content"];
       try {
         content = JSON.parse(msg.content);
       } catch {
         content = msg.content;
       }
+
       return { role: "ai", content };
     });
 
     setMessages(formatted);
     setSessionLoading(false);
   }
+
   async function createSession() {
-    const res = await fetch(
-      `${process.env.NEXT_PUBLIC_API_URL}/conversation/init`,
-      {
-        method: "POST",
-      },
-    );
+    const res = await fetch(getApiUrl("/conversation/init"), {
+      method: "POST",
+    });
     const data = await res.json();
-    return data.session_id;
+    return data.session_id as string;
   }
 
   async function handleFileReady(file: UploadedFile) {
@@ -85,16 +92,13 @@ export default function Home() {
 
   function handleRemoveFile(fileId: string) {
     setUploadedFiles((prev) => prev.filter((f) => f.file_id !== fileId));
+    setSessionFileIds((prev) => prev.filter((id) => id !== fileId));
   }
 
   async function ensureSession(): Promise<string> {
-    if (sessionId) {
-      console.log("Session already exists:", sessionId);
-      return sessionId;
-    }
-    console.log("No session yet, creating one...");
+    if (sessionId) return sessionId;
+
     const newId = await createSession();
-    console.log("New session created:", newId);
     setSessionId(newId);
     setSessionFiles([]);
     setSessionFileIds([]);
@@ -102,44 +106,38 @@ export default function Home() {
   }
 
   async function sendMessage() {
-    if (!input.trim() || !canChat) return;
+    if (!input.trim() || !canChat || loading) return;
 
+    const userQuery = input;
     const fileIds =
       uploadedFiles.length > 0
         ? uploadedFiles.map((f) => f.file_id)
         : sessionFileIds;
 
-    console.log("=== SENDING MESSAGE ===");
-    console.log("sessionId:", sessionId);
-    console.log("uploadedFiles:", uploadedFiles);
-    console.log("sessionFileIds:", sessionFileIds);
-    console.log("fileIds being sent:", fileIds);
-    const userMessage: Message = { role: "user", content: input };
-    setMessages((prev) => [...prev, userMessage]);
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: userQuery },
+      { role: "ai", content: "", isStreaming: true },
+    ]);
     setInput("");
     setLoading(true);
 
-    // Add an empty AI message that we'll fill in as tokens arrive
-    setMessages((prev) => [
-      ...prev,
-      { role: "ai", content: "", isStreaming: true },
-    ]);
+    const res = await fetch(getApiUrl("/conversation/stream"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file_ids: fileIds,
+        user_query: userQuery,
+        session_id: sessionId,
+      }),
+    });
 
-    const res = await fetch(
-      `${process.env.NEXT_PUBLIC_API_URL}/conversation/stream`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          file_ids: fileIds,
-          user_query: input,
-          session_id: sessionId,
-        }),
-      },
-    );
+    const reader = res.body?.getReader();
+    if (!reader) {
+      setLoading(false);
+      return;
+    }
 
-    // Read the stream
-    const reader = res.body!.getReader();
     const decoder = new TextDecoder();
 
     while (true) {
@@ -150,17 +148,17 @@ export default function Home() {
       const lines = text.split("\n").filter((l) => l.startsWith("data: "));
 
       for (const line of lines) {
-        const json = JSON.parse(line.replace("data: ", ""));
+        const json = JSON.parse(line.replace("data: ", "")) as StreamEvent;
 
         if (json.type === "session" && !sessionId) {
           setSessionId(json.session_id);
         }
 
         if (json.type === "token") {
-          // Append each token to the last message
           setMessages((prev) => {
             const updated = [...prev];
             const last = updated[updated.length - 1];
+
             return [
               ...updated.slice(0, -1),
               { ...last, content: (last.content as string) + json.value },
@@ -169,11 +167,10 @@ export default function Home() {
         }
 
         if (json.type === "structured") {
-          // Replace the streamed plain text with the full structured response
-          console.log("structured data received:", json.data);
           setMessages((prev) => {
             const updated = [...prev];
             const last = updated[updated.length - 1];
+
             return [
               ...updated.slice(0, -1),
               { ...last, content: json.data, isStreaming: false },
@@ -182,10 +179,10 @@ export default function Home() {
         }
 
         if (json.type === "done") {
-          // Mark streaming as finished
           setMessages((prev) => {
             const updated = [...prev];
             const last = updated[updated.length - 1];
+
             return [...updated.slice(0, -1), { ...last, isStreaming: false }];
           });
           setLoading(false);
@@ -194,27 +191,24 @@ export default function Home() {
     }
   }
 
-  const canChat = uploadedFiles.length > 0 || sessionId !== null;
-
   return (
-    <div className="flex h-screen bg-gray-900 text-white overflow-hidden">
+    <div className="flex h-screen overflow-hidden bg-gray-950 text-white">
       <Sidebar
         activeSessionId={sessionId}
         onSelectSession={handleSelectSession}
         onNewChat={handleNewChat}
       />
 
-      <main className="flex flex-col flex-1 overflow-hidden">
-        {/* File area */}
-        <div className="p-4 border-b border-gray-800 space-y-3">
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="border-b border-gray-800 bg-gray-950/95 px-5 py-4">
           <FileUploader
             onFileReady={handleFileReady}
-            sessionId={sessionId}
             onBeforeUpload={ensureSession}
           />
+
           {uploadedFiles.length > 0 && (
-            <div className="space-y-1">
-              <p className="text-xs text-gray-500 uppercase tracking-wide">
+            <div className="mt-3 space-y-2">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500">
                 Active files
               </p>
               <div className="flex flex-wrap gap-2">
@@ -229,21 +223,20 @@ export default function Home() {
             </div>
           )}
 
-          {/* Show session files when loading a past session with no new uploads */}
           {sessionId &&
             uploadedFiles.length === 0 &&
             sessionFileIds.length > 0 && (
-              <div className="space-y-1">
-                <p className="text-xs text-gray-500 uppercase tracking-wide">
+              <div className="mt-3 space-y-2">
+                <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500">
                   Files in this session
                 </p>
                 <div className="flex flex-wrap gap-2">
                   {sessionFiles.map((f) => (
                     <span
                       key={f.id}
-                      className="text-xs bg-violet-500/20 text-violet-400 border border-violet-500/30 px-3 py-1 rounded-full"
+                      className="rounded-md border border-gray-800 bg-gray-900 px-2.5 py-1.5 text-xs text-gray-300"
                     >
-                      📄 {f.doc_name}
+                      {f.doc_name}
                     </span>
                   ))}
                 </div>
@@ -251,17 +244,23 @@ export default function Home() {
             )}
         </div>
 
-        {/* Chat area */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto bg-gray-950">
           {sessionLoading ? (
-            <div className="flex flex-col items-center justify-center h-full text-gray-500">
-              <div className="w-8 h-8 border-2 border-violet-500 border-t-transparent rounded-full animate-spin mb-3" />
+            <div className="flex h-full flex-col items-center justify-center text-gray-500">
+              <div className="mb-3 h-8 w-8 rounded-full border-2 border-teal-500 border-t-transparent animate-spin" />
               <p className="text-sm">Loading session...</p>
             </div>
           ) : messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-gray-600">
-              <p className="text-4xl mb-3">💬</p>
-              <p className="text-sm">Upload a PDF and start asking questions</p>
+            <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+              <div className="max-w-sm">
+                <p className="text-lg font-medium text-gray-200">
+                  Upload a PDF to start
+                </p>
+                <p className="mt-2 text-sm leading-6 text-gray-500">
+                  Ask questions, compare sections, and pull cited answers from
+                  your documents.
+                </p>
+              </div>
             </div>
           ) : (
             <ChatWindow messages={messages} />
@@ -269,16 +268,15 @@ export default function Home() {
           <div ref={bottomRef} />
         </div>
 
-        {/* Input area */}
-        <div className="p-4 border-t border-gray-800">
+        <div className="border-t border-gray-800 bg-gray-950 px-5 py-4">
           {!canChat && (
-            <p className="text-xs text-center text-gray-600 mb-2">
+            <p className="mb-2 text-center text-xs text-gray-600">
               Upload at least one PDF to start chatting
             </p>
           )}
           <div className="flex gap-2">
             <input
-              className="flex-1 bg-gray-800 border border-gray-700 focus:border-violet-500 rounded-xl px-4 py-3 text-sm outline-none transition-colors placeholder-gray-500"
+              className="flex-1 rounded-lg border border-gray-800 bg-gray-900 px-4 py-3 text-sm outline-none transition-colors placeholder-gray-600 focus:border-teal-500"
               placeholder={
                 canChat
                   ? "Ask something about your PDFs..."
@@ -290,11 +288,12 @@ export default function Home() {
               onKeyDown={(e) => e.key === "Enter" && sendMessage()}
             />
             <button
+              type="button"
               onClick={sendMessage}
               disabled={!canChat || loading}
-              className="bg-violet-600 hover:bg-violet-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors px-5 py-3 rounded-xl text-sm font-medium"
+              className="rounded-lg bg-teal-600 px-5 py-3 text-sm font-medium text-white transition-colors hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {loading ? "..." : "Send"}
+              {loading ? "Sending" : "Send"}
             </button>
           </div>
         </div>

@@ -12,6 +12,7 @@ export interface AIResponse {
 export interface Message {
   role: "user" | "ai";
   content: string | AIResponse;
+  isStreaming?: boolean;
 }
 
 export interface Session {
