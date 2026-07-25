@@ -52,6 +52,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!frontend/chatbot/lib/
+!frontend/chatbot/lib/api.ts
 lib64/
 parts/
 sdist/
